@@ -3,10 +3,11 @@ package recoverycontroller
 import (
 	"context"
 	"fmt"
+	"time"
 
-	configv1 "github.com/openshift/api/config/v1"
-	features "github.com/openshift/api/features"
 	operatorv1 "github.com/openshift/api/operator/v1"
+	configeversionedclient "github.com/openshift/client-go/config/clientset/versioned"
+	configexternalinformers "github.com/openshift/client-go/config/informers/externalversions"
 	"github.com/openshift/cluster-kube-controller-manager-operator/pkg/operator"
 	"github.com/openshift/cluster-kube-controller-manager-operator/pkg/operator/certrotationcontroller"
 	"github.com/openshift/cluster-kube-controller-manager-operator/pkg/operator/operatorclient"
@@ -14,6 +15,7 @@ import (
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	"github.com/openshift/library-go/pkg/operator/genericoperatorclient"
+	"github.com/openshift/library-go/pkg/operator/status"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/kubernetes"
@@ -99,10 +101,22 @@ func (o *Options) Run(ctx context.Context, clock clock.Clock) error {
 	kubeInformersForNamespaces.Start(ctx.Done())
 	dynamicInformers.Start(ctx.Done())
 
-	// Create fake feature gate accessor - in refresh only when expired mode. There is no API server to fetch feature gates from.
-	emptyFeatureGates := []configv1.FeatureGateName{""}
-	disabledKnownFeatureGates := []configv1.FeatureGateName{features.FeatureShortCertRotation}
-	featureGateAccessor := featuregates.NewHardcodedFeatureGateAccess(emptyFeatureGates, disabledKnownFeatureGates)
+	configClient, err := configeversionedclient.NewForConfig(o.controllerContext.KubeConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create config client: %w", err)
+	}
+
+	configInformers := configexternalinformers.NewSharedInformerFactory(configClient, 10*time.Minute)
+	desiredVersion := status.VersionForOperatorFromEnv()
+	missingVersion := "0.0.1-snapshot"
+	featureGateAccessor := featuregates.NewFeatureGateAccess(
+		desiredVersion, missingVersion,
+		configInformers.Config().V1().ClusterVersions(), configInformers.Config().V1().FeatureGates(),
+		o.controllerContext.EventRecorder,
+	)
+
+	go configInformers.Start(ctx.Done())
+	go featureGateAccessor.Run(ctx)
 
 	certRotationController, err := certrotationcontroller.NewCertRotationControllerOnlyWhenExpired(
 		v1helpers.CachedSecretGetter(kubeClient.CoreV1(), kubeInformersForNamespaces),
@@ -125,6 +139,11 @@ func (o *Options) Run(ctx context.Context, clock clock.Clock) error {
 	if err != nil {
 		return err
 	}
+
+	// We can't start informers until after the resources have been requested. Now is the time.
+	kubeInformersForNamespaces.Start(ctx.Done())
+	dynamicInformers.Start(ctx.Done())
+	configInformers.Start(ctx.Done())
 
 	// FIXME: These are missing a wait group to track goroutines and handle graceful termination
 	// (@deads2k wants time to think it through)
